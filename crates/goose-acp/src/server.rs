@@ -27,19 +27,26 @@ use goose_acp_macros::custom_methods;
 use rmcp::model::{CallToolResult, RawContent, ResourceContents, Role};
 use sacp::schema::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, AuthenticateResponse, BlobResourceContents,
-    CancelNotification, Content, ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResource,
-    EmbeddedResourceResource, FileSystemCapability, ImageContent, InitializeRequest,
-    InitializeResponse, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate, Content,
+    ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResource, EmbeddedResourceResource,
+    FileSystemCapabilities, ImageContent, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, ModelId, ModelInfo, NewSessionRequest, NewSessionResponse,
     PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionMode, SessionModeId, SessionModeState,
-    SessionModelState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
+    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
     TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
-use sacp::{AgentToClient, ByteStreams, Handled, JrConnectionCx, JrMessageHandler, MessageCx};
+use sacp::util::MatchDispatchFrom;
+use sacp::{
+    Agent as SacpAgent, ByteStreams, Client, ConnectionTo, Dispatch, HandleDispatchFrom, Handled,
+    Responder,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
@@ -48,8 +55,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-// Agent binds provider, extensions, and permission channels to a single session.
-// ACP has no session/close, so sessions accumulate until transport closes.
 struct GooseAcpSession {
     agent: Arc<Agent>,
     messages: Conversation,
@@ -61,13 +66,14 @@ pub struct GooseAcpAgent {
     sessions: Arc<Mutex<HashMap<String, GooseAcpSession>>>,
     provider_factory: ProviderConstructor,
     builtins: Vec<String>,
-    client_fs_capabilities: OnceCell<FileSystemCapability>,
+    client_fs_capabilities: OnceCell<FileSystemCapabilities>,
     client_terminal: OnceCell<bool>,
     config_dir: std::path::PathBuf,
     session_manager: Arc<SessionManager>,
     permission_manager: Arc<PermissionManager>,
     goose_mode: GooseMode,
     disable_session_naming: bool,
+    advertise_config_options: bool,
 }
 
 fn mcp_server_to_extension_config(mcp_server: McpServer) -> Result<ExtensionConfig, String> {
@@ -341,11 +347,52 @@ fn build_mode_state(current_mode: GooseMode) -> Result<SessionModeState, sacp::E
     ))
 }
 
+fn build_mode_config_option(mode_state: &SessionModeState) -> SessionConfigOption {
+    let options: Vec<SessionConfigSelectOption> = mode_state
+        .available_modes
+        .iter()
+        .map(|m| {
+            SessionConfigSelectOption::new(m.id.0.clone(), m.name.clone())
+                .description(m.description.clone())
+        })
+        .collect();
+    SessionConfigOption::select(
+        "mode",
+        "Mode",
+        mode_state.current_mode_id.0.clone(),
+        options,
+    )
+    .category(SessionConfigOptionCategory::Mode)
+}
+
+fn build_model_config_option(model_state: &SessionModelState) -> SessionConfigOption {
+    let options: Vec<SessionConfigSelectOption> = model_state
+        .available_models
+        .iter()
+        .map(|m| SessionConfigSelectOption::new(m.model_id.0.clone(), m.name.clone()))
+        .collect();
+    SessionConfigOption::select(
+        "model",
+        "Model",
+        model_state.current_model_id.0.clone(),
+        options,
+    )
+    .category(SessionConfigOptionCategory::Model)
+}
+
 impl GooseAcpAgent {
     pub fn permission_manager(&self) -> Arc<PermissionManager> {
         Arc::clone(&self.permission_manager)
     }
 
+    /// Controls whether NewSessionResponse includes config_options.
+    /// When false, simulates an agent that doesn't advertise config_options,
+    /// forcing clients to use legacy set_mode/set_model methods.
+    pub fn set_advertise_config_options(&mut self, advertise: bool) {
+        self.advertise_config_options = advertise;
+    }
+
+    // TODO: goose reads Paths::in_state_dir globally (e.g. RequestLog), ignoring this data_dir.
     pub async fn new(
         provider_factory: ProviderConstructor,
         builtins: Vec<String>,
@@ -368,12 +415,13 @@ impl GooseAcpAgent {
             permission_manager,
             goose_mode,
             disable_session_naming,
+            advertise_config_options: true,
         })
     }
 
     async fn create_agent_for_session(
         &self,
-        cx: Option<&JrConnectionCx<AgentToClient>>,
+        cx: Option<&ConnectionTo<Client>>,
         session_id: Option<&SessionId>,
         goose_mode: Option<GooseMode>,
     ) -> Result<Arc<Agent>> {
@@ -506,7 +554,7 @@ impl GooseAcpAgent {
         content_item: &MessageContent,
         session_id: &SessionId,
         session: &mut GooseAcpSession,
-        cx: &JrConnectionCx<AgentToClient>,
+        cx: &ConnectionTo<Client>,
     ) -> Result<(), sacp::Error> {
         match content_item {
             MessageContent::Text(text) => {
@@ -562,7 +610,7 @@ impl GooseAcpAgent {
         tool_request: &goose::conversation::message::ToolRequest,
         session_id: &SessionId,
         session: &mut GooseAcpSession,
-        cx: &JrConnectionCx<AgentToClient>,
+        cx: &ConnectionTo<Client>,
     ) -> Result<(), sacp::Error> {
         session
             .tool_requests
@@ -592,7 +640,7 @@ impl GooseAcpAgent {
         tool_response: &goose::conversation::message::ToolResponse,
         session_id: &SessionId,
         session: &mut GooseAcpSession,
-        cx: &JrConnectionCx<AgentToClient>,
+        cx: &ConnectionTo<Client>,
     ) -> Result<(), sacp::Error> {
         let status = match &tool_response.tool_result {
             Ok(result) if result.is_error == Some(true) => ToolCallStatus::Failed,
@@ -635,7 +683,7 @@ impl GooseAcpAgent {
     #[allow(clippy::too_many_arguments)]
     fn handle_tool_permission_request(
         &self,
-        cx: &JrConnectionCx<AgentToClient>,
+        cx: &ConnectionTo<Client>,
         agent: &Arc<Agent>,
         session_id: &SessionId,
         request_id: String,
@@ -776,7 +824,11 @@ impl GooseAcpAgent {
 
         let capabilities = AgentCapabilities::new()
             .load_session(true)
-            .session_capabilities(SessionCapabilities::new().list(SessionListCapabilities::new()))
+            .session_capabilities(
+                SessionCapabilities::new()
+                    .list(SessionListCapabilities::new())
+                    .close(SessionCloseCapabilities::new()),
+            )
             .prompt_capabilities(
                 PromptCapabilities::new()
                     .image(true)
@@ -786,18 +838,15 @@ impl GooseAcpAgent {
             .mcp_capabilities(McpCapabilities::new().http(true));
         Ok(InitializeResponse::new(args.protocol_version)
             .agent_capabilities(capabilities)
-            .auth_methods(vec![AuthMethod::new(
-                "goose-provider",
-                "Configure Provider",
-            )
-            .description(
-                "Run `goose configure` to set up your AI provider and API key",
+            .auth_methods(vec![AuthMethod::Agent(
+                sacp::schema::AuthMethodAgent::new("goose-provider", "Configure Provider")
+                    .description("Run `goose configure` to set up your AI provider and API key"),
             )]))
     }
 
     async fn on_new_session(
         &self,
-        cx: &JrConnectionCx<AgentToClient>,
+        cx: &ConnectionTo<Client>,
         args: NewSessionRequest,
     ) -> Result<NewSessionResponse, sacp::Error> {
         debug!(?args, "new session request");
@@ -852,10 +901,22 @@ impl GooseAcpAgent {
         let model_state =
             build_model_state(&*provider, &provider.get_model_config().model_name).await;
         let mode_state = build_mode_state(self.goose_mode)?;
+        let config_options = if self.advertise_config_options {
+            Some(vec![
+                build_mode_config_option(&mode_state),
+                build_model_config_option(&model_state),
+            ])
+        } else {
+            None
+        };
 
-        Ok(NewSessionResponse::new(SessionId::new(goose_session.id))
+        let mut resp = NewSessionResponse::new(SessionId::new(goose_session.id))
             .models(model_state)
-            .modes(mode_state))
+            .modes(mode_state);
+        if let Some(opts) = config_options {
+            resp = resp.config_options(opts);
+        }
+        Ok(resp)
     }
 
     async fn init_provider(&self, agent: &Agent, session: &Session) -> Result<Arc<dyn Provider>> {
@@ -912,7 +973,7 @@ impl GooseAcpAgent {
 
     async fn on_load_session(
         &self,
-        cx: &JrConnectionCx<AgentToClient>,
+        cx: &ConnectionTo<Client>,
         args: LoadSessionRequest,
     ) -> Result<LoadSessionResponse, sacp::Error> {
         debug!(?args, "load session request");
@@ -1030,15 +1091,27 @@ impl GooseAcpAgent {
         let model_state =
             build_model_state(&*provider, &provider.get_model_config().model_name).await;
         let mode_state = build_mode_state(goose_mode)?;
+        let config_options = if self.advertise_config_options {
+            Some(vec![
+                build_mode_config_option(&mode_state),
+                build_model_config_option(&model_state),
+            ])
+        } else {
+            None
+        };
 
-        Ok(LoadSessionResponse::new()
+        let mut resp = LoadSessionResponse::new()
             .models(model_state)
-            .modes(mode_state))
+            .modes(mode_state);
+        if let Some(opts) = config_options {
+            resp = resp.config_options(opts);
+        }
+        Ok(resp)
     }
 
     async fn on_prompt(
         &self,
-        cx: &JrConnectionCx<AgentToClient>,
+        cx: &ConnectionTo<Client>,
         args: PromptRequest,
     ) -> Result<PromptResponse, sacp::Error> {
         let session_id = args.session_id.0.to_string();
@@ -1162,6 +1235,24 @@ impl GooseAcpAgent {
         Ok(SetSessionModelResponse::new())
     }
 
+    async fn build_config_options(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionConfigOption>, sacp::Error> {
+        let agent = self.get_session_agent(session_id, None).await?;
+        let provider = agent.provider().await.map_err(|e| {
+            sacp::Error::internal_error().data(format!("Failed to get provider: {}", e))
+        })?;
+        let mode = agent.goose_mode().await;
+        let mode_state = build_mode_state(mode)?;
+        let model_state =
+            build_model_state(&*provider, &provider.get_model_config().model_name).await;
+        Ok(vec![
+            build_mode_config_option(&mode_state),
+            build_model_config_option(&model_state),
+        ])
+    }
+
     async fn on_set_mode(
         &self,
         session_id: &str,
@@ -1181,11 +1272,45 @@ impl GooseAcpAgent {
 
         Ok(SetSessionModeResponse::new())
     }
+
+    async fn on_list_sessions(&self) -> Result<ListSessionsResponse, sacp::Error> {
+        let sessions = self
+            .session_manager
+            .list_sessions()
+            .await
+            .map_err(|e| sacp::Error::internal_error().data(e.to_string()))?;
+        let session_infos: Vec<SessionInfo> = sessions
+            .into_iter()
+            .map(|s| {
+                SessionInfo::new(SessionId::new(s.id), s.working_dir)
+                    .title(s.name)
+                    .updated_at(s.updated_at.to_rfc3339())
+            })
+            .collect();
+        Ok(ListSessionsResponse::new(session_infos))
+    }
+
+    async fn on_close_session(
+        &self,
+        session_id: &str,
+    ) -> Result<CloseSessionResponse, sacp::Error> {
+        let mut sessions = self.sessions.lock().await;
+        // Cancel before removing so that on_prompt (which reads the map) sees
+        // the cancellation before the session disappears.
+        if let Some(session) = sessions.get(session_id) {
+            if let Some(ref token) = session.cancel_token {
+                token.cancel();
+            }
+        }
+        sessions.remove(session_id);
+        info!(session_id = %session_id, "session closed");
+        Ok(CloseSessionResponse::new())
+    }
 }
 
 #[custom_methods]
 impl GooseAcpAgent {
-    #[custom_method("extensions/add")]
+    #[custom_method("_goose/extensions/add")]
     async fn on_add_extension(
         &self,
         req: AddExtensionRequest,
@@ -1200,7 +1325,7 @@ impl GooseAcpAgent {
         Ok(EmptyResponse {})
     }
 
-    #[custom_method("extensions/remove")]
+    #[custom_method("_goose/extensions/remove")]
     async fn on_remove_extension(
         &self,
         req: RemoveExtensionRequest,
@@ -1213,7 +1338,7 @@ impl GooseAcpAgent {
         Ok(EmptyResponse {})
     }
 
-    #[custom_method("tools")]
+    #[custom_method("_goose/tools")]
     async fn on_get_tools(&self, req: GetToolsRequest) -> Result<GetToolsResponse, sacp::Error> {
         let agent = self.get_session_agent(&req.session_id, None).await?;
         let tools = agent.list_tools(&req.session_id, None).await;
@@ -1225,7 +1350,7 @@ impl GooseAcpAgent {
         Ok(GetToolsResponse { tools: tools_json })
     }
 
-    #[custom_method("resource/read")]
+    #[custom_method("_goose/resource/read")]
     async fn on_read_resource(
         &self,
         req: ReadResourceRequest,
@@ -1244,7 +1369,7 @@ impl GooseAcpAgent {
         })
     }
 
-    #[custom_method("working_dir/update")]
+    #[custom_method("_goose/working_dir/update")]
     async fn on_update_working_dir(
         &self,
         req: UpdateWorkingDirRequest,
@@ -1276,24 +1401,7 @@ impl GooseAcpAgent {
         Ok(EmptyResponse {})
     }
 
-    #[custom_method("session/list")]
-    async fn on_list_sessions(&self) -> Result<ListSessionsResponse, sacp::Error> {
-        let sessions = self
-            .session_manager
-            .list_sessions()
-            .await
-            .map_err(|e| sacp::Error::internal_error().data(e.to_string()))?;
-        let session_infos: Vec<SessionInfo> = sessions
-            .into_iter()
-            .map(|s| {
-                SessionInfo::new(SessionId::new(s.id), s.working_dir)
-                    .title(s.name)
-                    .updated_at(s.updated_at.to_rfc3339())
-            })
-            .collect();
-        Ok(ListSessionsResponse::new(session_infos))
-    }
-
+    // TODO: use typed GetSessionRequest when agent-client-protocol-schema adds it (Discussion #60)
     #[custom_method("session/get")]
     async fn on_get_session(
         &self,
@@ -1311,6 +1419,7 @@ impl GooseAcpAgent {
         })
     }
 
+    // TODO: use typed DeleteSessionRequest when agent-client-protocol-schema adds it (RFD #395)
     #[custom_method("session/delete")]
     async fn on_delete_session(
         &self,
@@ -1323,7 +1432,7 @@ impl GooseAcpAgent {
         Ok(EmptyResponse {})
     }
 
-    #[custom_method("session/export")]
+    #[custom_method("_goose/session/export")]
     async fn on_export_session(
         &self,
         req: ExportSessionRequest,
@@ -1336,7 +1445,7 @@ impl GooseAcpAgent {
         Ok(ExportSessionResponse { data })
     }
 
-    #[custom_method("session/import")]
+    #[custom_method("_goose/session/import")]
     async fn on_import_session(
         &self,
         req: ImportSessionRequest,
@@ -1353,7 +1462,7 @@ impl GooseAcpAgent {
         })
     }
 
-    #[custom_method("config/extensions")]
+    #[custom_method("_goose/config/extensions")]
     async fn on_get_extensions(&self) -> Result<GetExtensionsResponse, sacp::Error> {
         let extensions = goose::config::extensions::get_all_extensions();
         let warnings = goose::config::extensions::get_warnings();
@@ -1373,62 +1482,57 @@ pub struct GooseAcpHandler {
     pub agent: Arc<GooseAcpAgent>,
 }
 
-impl JrMessageHandler for GooseAcpHandler {
-    type Link = AgentToClient;
-
+impl HandleDispatchFrom<Client> for GooseAcpHandler {
     fn describe_chain(&self) -> impl std::fmt::Debug {
         "goose-acp"
     }
 
-    fn handle_message(
+    fn handle_dispatch_from(
         &mut self,
-        message: MessageCx,
-        cx: JrConnectionCx<AgentToClient>,
-    ) -> impl std::future::Future<Output = Result<Handled<MessageCx>, sacp::Error>> + Send {
-        use sacp::util::MatchMessageFrom;
-        use sacp::JrRequestCx;
-
+        message: Dispatch,
+        cx: ConnectionTo<Client>,
+    ) -> impl std::future::Future<Output = Result<Handled<Dispatch>, sacp::Error>> + Send {
         let agent = self.agent.clone();
 
-        // The MatchMessageFrom chain produces an ~85KB async state machine.
+        // The MatchDispatchFrom chain produces an ~85KB async state machine.
         // Box::pin moves it to the heap so it doesn't overflow the tokio worker stack.
         Box::pin(async move {
-            MatchMessageFrom::new(message, &cx)
+            MatchDispatchFrom::new(message, &cx)
                 .if_request(
-                    |req: InitializeRequest, req_cx: JrRequestCx<InitializeResponse>| async {
-                        req_cx.respond(agent.on_initialize(req).await?)
+                    |req: InitializeRequest, responder: Responder<InitializeResponse>| async {
+                        responder.respond(agent.on_initialize(req).await?)
                     },
                 )
                 .await
                 .if_request(
-                    |_req: AuthenticateRequest, req_cx: JrRequestCx<AuthenticateResponse>| async {
-                        req_cx.respond(AuthenticateResponse::new())
+                    |_req: AuthenticateRequest, responder: Responder<AuthenticateResponse>| async {
+                        responder.respond(AuthenticateResponse::new())
                     },
                 )
                 .await
                 .if_request(
-                    |req: NewSessionRequest, req_cx: JrRequestCx<NewSessionResponse>| async {
-                        req_cx.respond(agent.on_new_session(&cx, req).await?)
+                    |req: NewSessionRequest, responder: Responder<NewSessionResponse>| async {
+                        responder.respond(agent.on_new_session(&cx, req).await?)
                     },
                 )
                 .await
                 .if_request(
-                    |req: LoadSessionRequest, req_cx: JrRequestCx<LoadSessionResponse>| async {
-                        req_cx.respond(agent.on_load_session(&cx, req).await?)
+                    |req: LoadSessionRequest, responder: Responder<LoadSessionResponse>| async {
+                        responder.respond(agent.on_load_session(&cx, req).await?)
                     },
                 )
                 .await
                 .if_request(
-                    |req: PromptRequest, req_cx: JrRequestCx<PromptResponse>| async {
+                    |req: PromptRequest, responder: Responder<PromptResponse>| async {
                         let agent = agent.clone();
                         let cx_clone = cx.clone();
                         cx.spawn(async move {
                             match agent.on_prompt(&cx_clone, req).await {
                                 Ok(response) => {
-                                    req_cx.respond(response)?;
+                                    responder.respond(response)?;
                                 }
                                 Err(e) => {
-                                    req_cx.respond_with_error(e)?;
+                                    responder.respond_with_error(e)?;
                                 }
                             }
                             Ok(())
@@ -1439,76 +1543,126 @@ impl JrMessageHandler for GooseAcpHandler {
                 .await
                 .if_notification(|notif: CancelNotification| async { agent.on_cancel(notif).await })
                 .await
-                // Handle methods not yet in the sacp typed API.
-                // - session/set_model, session/set_mode: typed support pending in sacp
-                // - _<method>: custom requests that will eventually route to goose-server
-                .otherwise({
+                .if_request({
                     let agent = agent.clone();
                     let cx = cx.clone();
-                    |message: MessageCx| async move {
+                    |req: SetSessionConfigOptionRequest, responder: Responder<SetSessionConfigOptionResponse>| async move {
+                        let value_id = req.value.as_value_id()
+                            .ok_or_else(|| sacp::Error::invalid_params().data("Expected a value ID"))?
+                            .clone();
+                        let session_id = req.session_id.clone();
+                        match req.config_id.0.as_ref() {
+                            "mode" => {
+                                match agent.on_set_mode(&session_id.0, &value_id.0).await {
+                                    Ok(_) => {}
+                                    Err(e) => { responder.respond_with_error(e)?; return Ok(()); }
+                                }
+                            }
+                            "model" => {
+                                match agent.on_set_model(&session_id.0, &value_id.0).await {
+                                    Ok(_) => {}
+                                    Err(e) => { responder.respond_with_error(e)?; return Ok(()); }
+                                }
+                            }
+                            other => {
+                                responder.respond_with_error(
+                                    sacp::Error::invalid_params().data(format!("Unsupported config option: {}", other))
+                                )?;
+                                return Ok(());
+                            }
+                        }
+                        let config_options = agent.build_config_options(&session_id.0).await?;
+                        // Notify before responding so clients see the config update before block_task unblocks.
+                        cx.send_notification(SessionNotification::new(
+                            session_id,
+                            SessionUpdate::ConfigOptionUpdate(
+                                ConfigOptionUpdate::new(config_options.clone()),
+                            ),
+                        ))?;
+                        responder.respond(SetSessionConfigOptionResponse::new(config_options))?;
+                        Ok(())
+                    }
+                })
+                .await
+                .if_request({
+                    let agent = agent.clone();
+                    let cx = cx.clone();
+                    |req: SetSessionModeRequest, responder: Responder<SetSessionModeResponse>| async move {
+                        let session_id = req.session_id.clone();
+                        let mode_id = req.mode_id.clone();
+                        match agent.on_set_mode(&session_id.0, &mode_id.0).await {
+                            Ok(resp) => {
+                                // Notify before responding so clients see the mode update before block_task unblocks.
+                                cx.send_notification(SessionNotification::new(
+                                    session_id,
+                                    SessionUpdate::CurrentModeUpdate(
+                                        CurrentModeUpdate::new(mode_id),
+                                    ),
+                                ))?;
+                                responder.respond(resp)?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_error(e)?;
+                            }
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+                .if_request({
+                    let agent = agent.clone();
+                    let cx = cx.clone();
+                    |req: SetSessionModelRequest, responder: Responder<SetSessionModelResponse>| async move {
+                        let session_id = req.session_id.clone();
+                        match agent.on_set_model(&session_id.0, &req.model_id.0).await {
+                            Ok(resp) => {
+                                let config_options = agent.build_config_options(&session_id.0).await?;
+                                cx.send_notification(SessionNotification::new(
+                                    session_id,
+                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+                                ))?;
+                                responder.respond(resp)?;
+                            }
+                            Err(e) => responder.respond_with_error(e)?,
+                        }
+                        Ok(())
+                    }
+                })
+                .await
+                .if_request({
+                    let agent = agent.clone();
+                    |_req: ListSessionsRequest, responder: Responder<ListSessionsResponse>| async move {
+                        responder.respond(agent.on_list_sessions().await?)
+                    }
+                })
+                .await
+                .if_request({
+                    let agent = agent.clone();
+                    |req: CloseSessionRequest, responder: Responder<CloseSessionResponse>| async move {
+                        responder.respond(agent.on_close_session(&req.session_id.0).await?)
+                    }
+                })
+                .await
+                .otherwise({
+                    let agent = agent.clone();
+                    |message: Dispatch| async move {
                         match message {
-                            MessageCx::Request(req, request_cx)
-                                if req.method == "session/set_mode" =>
-                            {
-                                let params: SetSessionModeRequest =
-                                    serde_json::from_value(req.params).map_err(|e| {
-                                        sacp::Error::invalid_params().data(e.to_string())
-                                    })?;
-                                let session_id = params.session_id.clone();
-                                let mode_id = params.mode_id.clone();
-                                match agent.on_set_mode(&session_id.0, &mode_id.0).await {
-                                    Ok(resp) => {
-                                        let json = serde_json::to_value(resp).map_err(|e| {
-                                            sacp::Error::internal_error().data(e.to_string())
-                                        })?;
-                                        // Notify before responding so clients see the mode
-                                        // update before block_task unblocks (serial dispatch).
-                                        cx.send_notification(SessionNotification::new(
-                                            session_id,
-                                            SessionUpdate::CurrentModeUpdate(
-                                                CurrentModeUpdate::new(mode_id),
-                                            ),
-                                        ))?;
-                                        request_cx.respond(json)?;
-                                    }
-                                    Err(e) => {
-                                        request_cx.respond_with_error(e)?;
-                                    }
-                                }
-                                Ok(())
-                            }
-                            MessageCx::Request(req, request_cx)
-                                if req.method == "session/set_model" =>
-                            {
-                                let params: SetSessionModelRequest =
-                                    serde_json::from_value(req.params).map_err(|e| {
-                                        sacp::Error::invalid_params().data(e.to_string())
-                                    })?;
-                                let resp = agent
-                                    .on_set_model(&params.session_id.0, &params.model_id.0)
-                                    .await?;
-                                let json = serde_json::to_value(resp).map_err(|e| {
-                                    sacp::Error::internal_error().data(e.to_string())
-                                })?;
-                                request_cx.respond(json)?;
-                                Ok(())
-                            }
-                            MessageCx::Request(req, request_cx) if req.method == "session/list" => {
-                                let resp = agent.on_list_sessions().await?;
-                                let json = serde_json::to_value(resp).map_err(|e| {
-                                    sacp::Error::internal_error().data(e.to_string())
-                                })?;
-                                request_cx.respond(json)?;
-                                Ok(())
-                            }
-                            MessageCx::Request(req, request_cx) if req.method.starts_with('_') => {
+                            Dispatch::Request(req, responder) => {
                                 match agent.handle_custom_request(&req.method, req.params).await {
-                                    Ok(json) => request_cx.respond(json)?,
-                                    Err(e) => request_cx.respond_with_error(e)?,
+                                    Ok(json) => responder.respond(json)?,
+                                    Err(e) => responder.respond_with_error(e)?,
                                 }
                                 Ok(())
                             }
-                            _ => Err(sacp::Error::method_not_found()),
+                            Dispatch::Response(result, router) => {
+                                debug!(method = %router.method(), id = %router.id(), ok = result.is_ok(), "routing response");
+                                router.respond_with_result(result)?;
+                                Ok(())
+                            }
+                            Dispatch::Notification(notif) => {
+                                debug!(method = %notif.method, "unhandled notification");
+                                Ok(())
+                            }
                         }
                     }
                 })
@@ -1530,10 +1684,11 @@ where
     Box::pin(async move {
         let handler = GooseAcpHandler { agent };
 
-        AgentToClient::builder()
+        SacpAgent
+            .builder()
             .name("goose-acp")
             .with_handler(handler)
-            .serve(ByteStreams::new(write, read))
+            .connect_to(ByteStreams::new(write, read))
             .await?;
 
         Ok(())
@@ -1565,8 +1720,8 @@ mod tests {
     use rmcp::model::{CallToolRequestParams, Content as RmcpContent};
     use sacp::schema::{
         EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
-        PermissionOptionId, ResourceLink, SelectedPermissionOutcome, SessionMode, SessionModeId,
-        SessionModeState,
+        PermissionOptionId, ResourceLink, SelectedPermissionOutcome, SessionConfigSelectOption,
+        SessionMode, SessionModeId, SessionModeState,
     };
     use std::io::Write;
     use std::path::PathBuf;
@@ -1939,5 +2094,69 @@ print(\"hello, world\")
                 ],
             )
         );
+    }
+
+    #[test_case(
+        build_mode_state(GooseMode::Auto).unwrap()
+        => SessionConfigOption::select(
+            "mode", "Mode", "auto",
+            vec![
+                SessionConfigSelectOption::new("auto", "auto").description("Automatically approve tool calls"),
+                SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
+                SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Ask only for sensitive tool calls"),
+                SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),
+            ],
+        ).category(SessionConfigOptionCategory::Mode)
+        ; "auto mode produces correct config option"
+    )]
+    #[test_case(
+        build_mode_state(GooseMode::Approve).unwrap()
+        => SessionConfigOption::select(
+            "mode", "Mode", "approve",
+            vec![
+                SessionConfigSelectOption::new("auto", "auto").description("Automatically approve tool calls"),
+                SessionConfigSelectOption::new("approve", "approve").description("Ask before every tool call"),
+                SessionConfigSelectOption::new("smart_approve", "smart_approve").description("Ask only for sensitive tool calls"),
+                SessionConfigSelectOption::new("chat", "chat").description("Chat only, no tool calls"),
+            ],
+        ).category(SessionConfigOptionCategory::Mode)
+        ; "approve mode produces correct config option"
+    )]
+    fn test_build_mode_config_option(state: SessionModeState) -> SessionConfigOption {
+        build_mode_config_option(&state)
+    }
+
+    #[test_case(
+        SessionModelState::new(
+            ModelId::new("gpt-4"),
+            vec![ModelInfo::new(ModelId::new("gpt-4"), "gpt-4"), ModelInfo::new(ModelId::new("gpt-3.5"), "gpt-3.5")],
+        )
+        => SessionConfigOption::select(
+            "model", "Model", "gpt-4",
+            vec![
+                SessionConfigSelectOption::new("gpt-4", "gpt-4"),
+                SessionConfigSelectOption::new("gpt-3.5", "gpt-3.5"),
+            ],
+        ).category(SessionConfigOptionCategory::Model)
+        ; "multiple models"
+    )]
+    #[test_case(
+        SessionModelState::new(ModelId::new("only-model"), vec![ModelInfo::new(ModelId::new("only-model"), "only-model")])
+        => SessionConfigOption::select(
+            "model", "Model", "only-model",
+            vec![SessionConfigSelectOption::new("only-model", "only-model")],
+        ).category(SessionConfigOptionCategory::Model)
+        ; "single model"
+    )]
+    #[test_case(
+        SessionModelState::new(ModelId::new("orphan"), vec![])
+        => SessionConfigOption::select(
+            "model", "Model", "orphan",
+            Vec::<SessionConfigSelectOption>::new(),
+        ).category(SessionConfigOptionCategory::Model)
+        ; "empty model list"
+    )]
+    fn test_build_model_config_option(state: SessionModelState) -> SessionConfigOption {
+        build_model_config_option(&state)
     }
 }

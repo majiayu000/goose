@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::acp::{
@@ -11,7 +12,7 @@ use crate::model::ModelConfig;
 use crate::providers::base::{ProviderDef, ProviderMetadata};
 
 const GEMINI_ACP_PROVIDER_NAME: &str = "gemini-acp";
-pub const GEMINI_ACP_DEFAULT_MODEL: &str = "default";
+pub const GEMINI_ACP_DEFAULT_MODEL: &str = "auto-gemini-3";
 const GEMINI_ACP_DOC_URL: &str = "https://github.com/google-gemini/gemini-cli";
 
 pub struct GeminiAcpProvider;
@@ -48,10 +49,17 @@ impl ProviderDef for GeminiAcpProvider {
             };
 
             let mut args = vec!["--acp".to_string()];
-            if model.model_name != "default" {
+            if model.model_name != GEMINI_ACP_DEFAULT_MODEL {
                 args.push("--model".to_string());
                 args.push(model.model_name.clone());
             }
+
+            let mode_mapping = HashMap::from([
+                (GooseMode::Auto, "yolo".to_string()),
+                (GooseMode::Approve, "default".to_string()),
+                (GooseMode::SmartApprove, "auto_edit".to_string()),
+                (GooseMode::Chat, "plan".to_string()),
+            ]);
 
             let provider_config = AcpProviderConfig {
                 command: resolved_command,
@@ -60,7 +68,8 @@ impl ProviderDef for GeminiAcpProvider {
                 env_remove: vec![],
                 work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 mcp_servers: extension_configs_to_mcp_servers(&extensions),
-                session_mode_id: Some(map_goose_mode(goose_mode)),
+                session_mode_id: Some(mode_mapping[&goose_mode].clone()),
+                mode_mapping,
                 permission_mapping,
                 notification_callback: None,
             };
@@ -68,14 +77,5 @@ impl ProviderDef for GeminiAcpProvider {
             let metadata = Self::metadata();
             AcpProvider::connect(metadata.name, model, goose_mode, provider_config).await
         })
-    }
-}
-
-fn map_goose_mode(goose_mode: GooseMode) -> String {
-    match goose_mode {
-        GooseMode::Auto => "yolo".to_string(),
-        GooseMode::Approve => "default".to_string(),
-        GooseMode::SmartApprove => "auto_edit".to_string(),
-        GooseMode::Chat => "plan".to_string(),
     }
 }

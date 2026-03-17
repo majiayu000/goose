@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::acp::{
@@ -74,6 +75,13 @@ impl ProviderDef for CodexAcpProvider {
                 rejected_tool_status: sacp::schema::ToolCallStatus::Failed,
             };
 
+            let mode_mapping = HashMap::from([
+                (GooseMode::Auto, "full-access".to_string()),
+                (GooseMode::Approve, "read-only".to_string()),
+                (GooseMode::SmartApprove, "auto".to_string()),
+                (GooseMode::Chat, "read-only".to_string()),
+            ]);
+
             let provider_config = AcpProviderConfig {
                 command: resolved_command,
                 args,
@@ -83,6 +91,7 @@ impl ProviderDef for CodexAcpProvider {
                 mcp_servers,
                 // Disabled until https://github.com/zed-industries/codex-acp/issues/179 is fixed.
                 session_mode_id: None,
+                mode_mapping,
                 permission_mapping,
                 notification_callback: None,
             };

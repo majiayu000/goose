@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use fs_err as fs;
 pub use goose::acp::{map_permission_response, PermissionDecision, PermissionMapping};
 use goose::builtin_extension::register_builtin_extensions;
+use goose::config::paths::Paths;
 use goose::config::{GooseMode, PermissionManager};
 use goose::providers::api_client::{ApiClient, AuthMethod as ApiAuthMethod};
 use goose::providers::base::Provider;
@@ -14,10 +15,10 @@ use goose::session_context::SESSION_ID_HEADER;
 use goose_acp::server::{serve, GooseAcpAgent};
 use goose_test_support::{ExpectedSessionId, TEST_MODEL};
 use sacp::schema::{
-    AuthMethod, CreateTerminalResponse, KillTerminalCommandResponse, McpServer,
-    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalResponse, SessionModeState,
-    SessionModelState, SessionUpdate, TerminalExitStatus, TerminalId, TerminalOutputResponse,
-    ToolCallContent, ToolCallStatus, ToolKind, WaitForTerminalExitResponse, WriteTextFileRequest,
+    AuthMethod, CreateTerminalResponse, KillTerminalResponse, McpServer, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalResponse, SessionModeState, SessionModelState,
+    SessionUpdate, TerminalExitStatus, TerminalId, TerminalOutputResponse, ToolCallContent,
+    ToolCallStatus, ToolKind, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
 use std::collections::VecDeque;
@@ -155,8 +156,11 @@ pub async fn spawn_acp_server_in_process(
     data_root: &std::path::Path,
     goose_mode: GooseMode,
     provider_factory: Option<ProviderConstructor>,
+    advertise_config_options: bool,
 ) -> (DuplexTransport, JoinHandle<()>, Arc<PermissionManager>) {
     fs::create_dir_all(data_root).unwrap();
+    // TODO: Paths::in_state_dir is global, ignoring per-test data_root
+    fs::create_dir_all(Paths::in_state_dir("logs")).unwrap();
     let config_path = data_root.join(goose::config::base::CONFIG_YAML_NAME);
     if !config_path.exists() {
         fs::write(
@@ -180,18 +184,18 @@ pub async fn spawn_acp_server_in_process(
         })
     });
 
-    let agent = Arc::new(
-        GooseAcpAgent::new(
-            provider_factory,
-            builtins.to_vec(),
-            data_root.to_path_buf(),
-            data_root.to_path_buf(),
-            goose_mode,
-            true,
-        )
-        .await
-        .unwrap(),
-    );
+    let mut agent = GooseAcpAgent::new(
+        provider_factory,
+        builtins.to_vec(),
+        data_root.to_path_buf(),
+        data_root.to_path_buf(),
+        goose_mode,
+        true,
+    )
+    .await
+    .unwrap();
+    agent.set_advertise_config_options(advertise_config_options);
+    let agent = Arc::new(agent);
     let permission_manager = agent.permission_manager();
     let (transport, handle) = serve_agent_in_process(agent).await;
 
@@ -437,11 +441,11 @@ impl TerminalFixture {
         ReleaseTerminalResponse::new()
     }
 
-    pub fn on_kill(&self, terminal_id: &TerminalId) -> KillTerminalCommandResponse {
+    pub fn on_kill(&self, terminal_id: &TerminalId) -> KillTerminalResponse {
         if let Some(TerminalCall::Kill(expected_id)) = self.pop("kill") {
             self.validate_terminal_id("kill", &expected_id, terminal_id);
         }
-        KillTerminalCommandResponse::new()
+        KillTerminalResponse::new()
     }
 
     pub fn assert_called(&self) {
@@ -471,6 +475,10 @@ pub struct TestConnectionConfig {
     pub read_text_file: Option<ReadTextFileHandler>,
     pub write_text_file: Option<WriteTextFileHandler>,
     pub terminal: Option<Arc<TerminalFixture>>,
+    /// When false, the goose server omits config_options from NewSessionResponse,
+    /// simulating an agent that doesn't support them. This forces the provider
+    /// to use legacy set_mode / set_model methods instead of set_config_option.
+    pub advertise_config_options: bool,
 }
 
 impl Default for TestConnectionConfig {
@@ -485,6 +493,7 @@ impl Default for TestConnectionConfig {
             read_text_file: None,
             write_text_file: None,
             terminal: None,
+            advertise_config_options: true,
         }
     }
 }
@@ -501,9 +510,19 @@ pub trait Connection: Sized {
         session_id: &str,
         mcp_servers: Vec<McpServer>,
     ) -> SessionResult<Self::Session>;
+    async fn list_sessions(&self) -> anyhow::Result<sacp::schema::ListSessionsResponse>;
+    async fn close_session(&self, session_id: &str) -> anyhow::Result<()>;
+    async fn delete_session(&self, session_id: &str) -> anyhow::Result<()>;
     async fn set_mode(&self, session_id: &str, mode_id: &str) -> anyhow::Result<()>;
     async fn set_model(&self, session_id: &str, model_id: &str) -> anyhow::Result<()>;
+    async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> anyhow::Result<()>;
     fn auth_methods(&self) -> &[AuthMethod];
+    fn data_root(&self) -> std::path::PathBuf;
     fn reset_openai(&self);
     fn reset_permissions(&self);
 }
@@ -511,6 +530,7 @@ pub trait Connection: Sized {
 #[async_trait]
 pub trait Session {
     fn session_id(&self) -> &sacp::schema::SessionId;
+    fn work_dir(&self) -> std::path::PathBuf;
     fn notifications(&self) -> Vec<Notification>;
     async fn prompt(&mut self, text: &str, decision: PermissionDecision) -> TestOutput;
     async fn prompt_with_image(
@@ -546,6 +566,15 @@ where
         // Re-raise the original panic so the test shows the real failure message.
         std::panic::resume_unwind(err);
     }
+}
+
+pub async fn send_custom(
+    cx: &sacp::ConnectionTo<sacp::Agent>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, sacp::Error> {
+    let msg = sacp::UntypedMessage::new(method, params).unwrap();
+    cx.send_request(msg).block_task().await
 }
 
 pub mod provider;

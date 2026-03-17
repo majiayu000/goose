@@ -576,7 +576,7 @@ impl CliSession {
             }
             InputResult::GooseMode(mode) => {
                 history.save(editor);
-                self.handle_goose_mode(&mode)?;
+                self.handle_goose_mode(&mode).await?;
             }
             InputResult::Plan(options) => {
                 self.handle_plan_mode(options).await?;
@@ -709,7 +709,7 @@ impl CliSession {
         }
     }
 
-    fn handle_goose_mode(&self, mode: &str) -> Result<()> {
+    async fn handle_goose_mode(&self, mode: &str) -> Result<()> {
         let config = Config::global();
         let mode = match GooseMode::from_str(&mode.to_lowercase()) {
             Ok(mode) => mode,
@@ -721,6 +721,12 @@ impl CliSession {
                 return Ok(());
             }
         };
+        if let Ok(provider) = self.agent.provider().await {
+            provider
+                .update_mode(&self.session_id, mode)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
         config.set_goose_mode(mode)?;
         output::goose_mode_message(&format!("Goose mode set to '{mode}'"));
         Ok(())

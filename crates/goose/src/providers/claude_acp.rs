@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::acp::{
@@ -51,6 +52,17 @@ impl ProviderDef for ClaudeAcpProvider {
                 rejected_tool_status: sacp::schema::ToolCallStatus::Failed,
             };
 
+            let mode_mapping = HashMap::from([
+                // Closest to "autonomous": bypassPermissions skips confirmations.
+                (GooseMode::Auto, "bypassPermissions".to_string()),
+                // Claude Code's default matches "ask before risky actions".
+                (GooseMode::Approve, "default".to_string()),
+                // acceptEdits auto-accepts file edits but still prompts for risky ops.
+                (GooseMode::SmartApprove, "acceptEdits".to_string()),
+                // Plan mode disables tool execution, aligning with chat-only intent.
+                (GooseMode::Chat, "plan".to_string()),
+            ]);
+
             let provider_config = AcpProviderConfig {
                 command: resolved_command,
                 args: vec![],
@@ -59,7 +71,8 @@ impl ProviderDef for ClaudeAcpProvider {
                 env_remove: vec!["CLAUDECODE".to_string()],
                 work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 mcp_servers: extension_configs_to_mcp_servers(&extensions),
-                session_mode_id: Some(map_goose_mode(goose_mode)),
+                session_mode_id: Some(mode_mapping[&goose_mode].clone()),
+                mode_mapping,
                 permission_mapping,
                 notification_callback: None,
             };
@@ -67,26 +80,5 @@ impl ProviderDef for ClaudeAcpProvider {
             let metadata = Self::metadata();
             AcpProvider::connect(metadata.name, model, goose_mode, provider_config).await
         })
-    }
-}
-
-fn map_goose_mode(goose_mode: GooseMode) -> String {
-    match goose_mode {
-        GooseMode::Auto => {
-            // Closest to "autonomous": Claude Code's bypassPermissions skips confirmations.
-            "bypassPermissions".to_string()
-        }
-        GooseMode::Approve => {
-            // Claude Code's default matches "ask before risky actions".
-            "default".to_string()
-        }
-        GooseMode::SmartApprove => {
-            // Best-effort: acceptEdits auto-accepts file edits but still prompts for risky ops.
-            "acceptEdits".to_string()
-        }
-        GooseMode::Chat => {
-            // Plan mode disables tool execution, aligning with chat-only intent.
-            "plan".to_string()
-        }
     }
 }
