@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::acp::{
     extension_configs_to_mcp_servers, AcpProvider, AcpProviderConfig, PermissionMapping,
+    ACP_CURRENT_MODEL,
 };
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, GooseMode};
@@ -12,7 +13,6 @@ use crate::model::ModelConfig;
 use crate::providers::base::{ProviderDef, ProviderMetadata};
 
 const CLAUDE_ACP_PROVIDER_NAME: &str = "claude-acp";
-pub const CLAUDE_ACP_DEFAULT_MODEL: &str = "default";
 const CLAUDE_ACP_DOC_URL: &str = "https://github.com/zed-industries/claude-agent-acp";
 const CLAUDE_ACP_BINARY: &str = "claude-agent-acp";
 
@@ -26,7 +26,7 @@ impl ProviderDef for ClaudeAcpProvider {
             CLAUDE_ACP_PROVIDER_NAME,
             "Claude Code",
             "ACP wrapper for Anthropic's Claude. Install: npm install -g @zed-industries/claude-agent-acp",
-            CLAUDE_ACP_DEFAULT_MODEL,
+            ACP_CURRENT_MODEL,
             vec![],
             CLAUDE_ACP_DOC_URL,
             vec![],

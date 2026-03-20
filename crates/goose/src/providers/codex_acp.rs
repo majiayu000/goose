@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::acp::{
     extension_configs_to_mcp_servers, AcpProvider, AcpProviderConfig, PermissionMapping,
+    ACP_CURRENT_MODEL,
 };
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, GooseMode};
@@ -12,7 +13,6 @@ use crate::model::ModelConfig;
 use crate::providers::base::{ProviderDef, ProviderMetadata};
 
 const CODEX_ACP_PROVIDER_NAME: &str = "codex-acp";
-pub const CODEX_ACP_DEFAULT_MODEL: &str = "gpt-5.2-codex";
 const CODEX_ACP_DOC_URL: &str = "https://github.com/zed-industries/codex-acp";
 
 pub struct CodexAcpProvider;
@@ -25,7 +25,7 @@ impl ProviderDef for CodexAcpProvider {
             CODEX_ACP_PROVIDER_NAME,
             "Codex CLI",
             "ACP adapter for OpenAI's coding assistant. Install: npm install -g @zed-industries/codex-acp",
-            CODEX_ACP_DEFAULT_MODEL,
+            ACP_CURRENT_MODEL,
             vec![],
             CODEX_ACP_DOC_URL,
             vec![],

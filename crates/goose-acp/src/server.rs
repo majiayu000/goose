@@ -312,21 +312,21 @@ fn builtin_to_extension_config(name: &str) -> ExtensionConfig {
     }
 }
 
-async fn build_model_state(provider: &dyn Provider, current_model: &str) -> SessionModelState {
-    let models = match provider.fetch_recommended_models().await {
-        Ok(models) => models,
-        Err(e) => {
-            warn!(error = %e, "failed to fetch models, model selection will be unavailable");
-            vec![]
-        }
-    };
-    SessionModelState::new(
+async fn build_model_state(
+    provider: &dyn Provider,
+    current_model: &str,
+) -> Result<SessionModelState, sacp::Error> {
+    let models = provider
+        .fetch_recommended_models()
+        .await
+        .map_err(|e| sacp::Error::internal_error().data(e.to_string()))?;
+    Ok(SessionModelState::new(
         ModelId::new(current_model),
         models
             .iter()
             .map(|name| ModelInfo::new(ModelId::new(&**name), &**name))
             .collect(),
-    )
+    ))
 }
 
 fn build_mode_state(current_mode: GooseMode) -> Result<SessionModeState, sacp::Error> {
@@ -899,7 +899,7 @@ impl GooseAcpAgent {
         );
 
         let model_state =
-            build_model_state(&*provider, &provider.get_model_config().model_name).await;
+            build_model_state(&*provider, &provider.get_model_config().model_name).await?;
         let mode_state = build_mode_state(self.goose_mode)?;
         let config_options = if self.advertise_config_options {
             Some(vec![
@@ -1089,7 +1089,7 @@ impl GooseAcpAgent {
         );
 
         let model_state =
-            build_model_state(&*provider, &provider.get_model_config().model_name).await;
+            build_model_state(&*provider, &provider.get_model_config().model_name).await?;
         let mode_state = build_mode_state(goose_mode)?;
         let config_options = if self.advertise_config_options {
             Some(vec![
@@ -1246,7 +1246,7 @@ impl GooseAcpAgent {
         let mode = agent.goose_mode().await;
         let mode_state = build_mode_state(mode)?;
         let model_state =
-            build_model_state(&*provider, &provider.get_model_config().model_name).await;
+            build_model_state(&*provider, &provider.get_model_config().model_name).await?;
         Ok(vec![
             build_mode_config_option(&mode_state),
             build_model_config_option(&model_state),
@@ -1902,37 +1902,37 @@ print(\"hello, world\")
 
     #[test_case(
         "model-a", Ok(vec!["model-a".into(), "model-b".into()])
-        => SessionModelState::new(
+        => Ok(SessionModelState::new(
             ModelId::new("model-a"),
             vec![ModelInfo::new(ModelId::new("model-a"), "model-a"),
                  ModelInfo::new(ModelId::new("model-b"), "model-b")],
-        )
+        ))
         ; "returns current and available models"
     )]
     #[test_case(
         "model-a", Ok(vec![])
-        => SessionModelState::new(ModelId::new("model-a"), vec![])
+        => Ok(SessionModelState::new(ModelId::new("model-a"), vec![]))
         ; "empty model list"
     )]
     #[test_case(
         "model-a", Err(ProviderError::ExecutionError("fail".into()))
-        => SessionModelState::new(ModelId::new("model-a"), vec![])
-        ; "fetch error falls back to current model only"
+        => Err(sacp::Error::internal_error().data("Execution error: fail".to_string()))
+        ; "fetch error propagates"
     )]
     #[test_case(
         "switched-model", Ok(vec!["model-a".into(), "switched-model".into()])
-        => SessionModelState::new(
+        => Ok(SessionModelState::new(
             ModelId::new("switched-model"),
             vec![ModelInfo::new(ModelId::new("model-a"), "model-a"),
                  ModelInfo::new(ModelId::new("switched-model"), "switched-model")],
-        )
+        ))
         ; "current model reflects switched model"
     )]
     #[tokio::test]
     async fn test_build_model_state(
         current_model: &str,
         models: Result<Vec<String>, ProviderError>,
-    ) -> SessionModelState {
+    ) -> Result<SessionModelState, sacp::Error> {
         let provider = MockModelProvider { models };
         build_model_state(&provider, current_model).await
     }

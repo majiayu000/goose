@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::acp::{
     extension_configs_to_mcp_servers, AcpProvider, AcpProviderConfig, PermissionMapping,
+    ACP_CURRENT_MODEL,
 };
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, GooseMode};
@@ -12,7 +13,6 @@ use crate::model::ModelConfig;
 use crate::providers::base::{ProviderDef, ProviderMetadata};
 
 const GEMINI_ACP_PROVIDER_NAME: &str = "gemini-acp";
-pub const GEMINI_ACP_DEFAULT_MODEL: &str = "auto-gemini-3";
 const GEMINI_ACP_DOC_URL: &str = "https://github.com/google-gemini/gemini-cli";
 
 pub struct GeminiAcpProvider;
@@ -25,7 +25,7 @@ impl ProviderDef for GeminiAcpProvider {
             GEMINI_ACP_PROVIDER_NAME,
             "Gemini CLI (ACP)",
             "ACP provider for Google's Gemini CLI. Install: npm install -g @google/gemini-cli",
-            GEMINI_ACP_DEFAULT_MODEL,
+            ACP_CURRENT_MODEL,
             vec![],
             GEMINI_ACP_DOC_URL,
             vec![],
@@ -49,7 +49,7 @@ impl ProviderDef for GeminiAcpProvider {
             };
 
             let mut args = vec!["--acp".to_string()];
-            if model.model_name != GEMINI_ACP_DEFAULT_MODEL {
+            if model.model_name != ACP_CURRENT_MODEL {
                 args.push("--model".to_string());
                 args.push(model.model_name.clone());
             }
