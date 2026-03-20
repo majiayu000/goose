@@ -721,12 +721,9 @@ impl CliSession {
                 return Ok(());
             }
         };
-        if let Ok(provider) = self.agent.provider().await {
-            provider
-                .update_mode(&self.session_id, mode)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        self.agent
+            .update_goose_mode(mode, &self.session_id)
+            .await?;
         config.set_goose_mode(mode)?;
         output::goose_mode_message(&format!("Goose mode set to '{mode}'"));
         Ok(())
