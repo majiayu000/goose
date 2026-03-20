@@ -75,6 +75,7 @@ impl ProviderDef for CodexAcpProvider {
                 rejected_tool_status: sacp::schema::ToolCallStatus::Failed,
             };
 
+            // Chat and Approve both map to "read-only" — codex has no plan mode.
             let mode_mapping = HashMap::from([
                 (GooseMode::Auto, "full-access".to_string()),
                 (GooseMode::Approve, "read-only".to_string()),

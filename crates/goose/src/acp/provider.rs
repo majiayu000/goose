@@ -121,6 +121,7 @@ pub struct AcpProvider {
     /// Per-session model tracking for detecting model changes in stream().
     session_model: Arc<TokioMutex<HashMap<String, String>>>,
     auth_methods: Vec<AuthMethod>,
+    supports_close: bool,
     init_session: OnceCell<NewSessionResponse>,
 }
 
@@ -168,6 +169,11 @@ impl AcpProvider {
             .await
             .context("ACP client initialization cancelled")??;
 
+        let supports_close = init_response
+            .agent_capabilities
+            .session_capabilities
+            .close
+            .is_some();
         let mut provider = Self::new_with_runtime(
             name,
             model,
@@ -178,6 +184,7 @@ impl AcpProvider {
             permission_mapping,
             rejected_tool_calls,
             init_response.auth_methods,
+            supports_close,
         );
         if provider.model.model_name == ACP_CURRENT_MODEL {
             let response = provider.get_init_session().await?;
@@ -223,6 +230,11 @@ impl AcpProvider {
             .await
             .context("ACP client initialization cancelled")??;
 
+        let supports_close = init_response
+            .agent_capabilities
+            .session_capabilities
+            .close
+            .is_some();
         let mut provider = Self::new_with_runtime(
             name,
             model,
@@ -233,6 +245,7 @@ impl AcpProvider {
             permission_mapping,
             rejected_tool_calls,
             init_response.auth_methods,
+            supports_close,
         );
         if provider.model.model_name == ACP_CURRENT_MODEL {
             let response = provider.get_init_session().await?;
@@ -259,6 +272,7 @@ impl AcpProvider {
         permission_mapping: PermissionMapping,
         rejected_tool_calls: Arc<TokioMutex<HashSet<String>>>,
         auth_methods: Vec<AuthMethod>,
+        supports_close: bool,
     ) -> Self {
         Self {
             name,
@@ -274,6 +288,7 @@ impl AcpProvider {
             acp_to_goose_id: Arc::new(TokioMutex::new(HashMap::new())),
             session_model: Arc::new(TokioMutex::new(HashMap::new())),
             auth_methods,
+            supports_close,
             init_session: OnceCell::new(),
         }
     }
@@ -491,8 +506,10 @@ impl AcpProvider {
         self.init_session
             .get_or_try_init(|| async {
                 let response = self.new_session().await?;
-                self.close_session_by_acp_id(response.session_id.clone())
-                    .await?;
+                if self.supports_close {
+                    self.close_session_by_acp_id(response.session_id.clone())
+                        .await?;
+                }
                 Ok(response)
             })
             .await
@@ -823,9 +840,11 @@ impl AcpClientLoop {
                         // reflect any prior set_mode before the next prompt.
                         match &notification.update {
                             SessionUpdate::CurrentModeUpdate(update) => {
-                                if let Some(&mode) =
-                                    reverse_modes.get(update.current_mode_id.0.as_ref())
-                                {
+                                if let Some(mode) = resolve_mode(
+                                    &reverse_modes,
+                                    update.current_mode_id.0.as_ref(),
+                                    &goose_mode,
+                                ) {
                                     if let Ok(mut guard) = goose_mode.lock() {
                                         *guard = mode;
                                     }
@@ -835,9 +854,11 @@ impl AcpClientLoop {
                                 for opt in &update.config_options {
                                     if opt.category == Some(SessionConfigOptionCategory::Mode) {
                                         if let SessionConfigKind::Select(sel) = &opt.kind {
-                                            if let Some(&mode) =
-                                                reverse_modes.get(sel.current_value.0.as_ref())
-                                            {
+                                            if let Some(mode) = resolve_mode(
+                                                &reverse_modes,
+                                                sel.current_value.0.as_ref(),
+                                                &goose_mode,
+                                            ) {
                                                 if let Ok(mut guard) = goose_mode.lock() {
                                                     *guard = mode;
                                                 }
@@ -1349,8 +1370,33 @@ fn build_action_required_message(request: &RequestPermissionRequest) -> Option<M
     )
 }
 
-fn reverse_mode_mapping(mode_mapping: &HashMap<GooseMode, String>) -> HashMap<String, GooseMode> {
-    mode_mapping.iter().map(|(k, v)| (v.clone(), *k)).collect()
+fn reverse_mode_mapping(
+    mode_mapping: &HashMap<GooseMode, String>,
+) -> HashMap<String, Vec<GooseMode>> {
+    let mut reverse: HashMap<String, Vec<GooseMode>> = HashMap::new();
+    for (mode, id) in mode_mapping {
+        reverse.entry(id.clone()).or_default().push(*mode);
+    }
+    reverse
+}
+
+// When multiple GooseModes map to the same provider ID (e.g. codex "read-only"),
+// prefer the current mode if it's among candidates.
+fn resolve_mode(
+    reverse_modes: &HashMap<String, Vec<GooseMode>>,
+    mode_id: &str,
+    current: &Arc<Mutex<GooseMode>>,
+) -> Option<GooseMode> {
+    let candidates = reverse_modes.get(mode_id)?;
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+    let current = current.lock().ok()?;
+    if candidates.contains(&*current) {
+        Some(*current)
+    } else {
+        Some(candidates[0])
+    }
 }
 
 fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDecision> {
@@ -1552,10 +1598,10 @@ mod tests {
             (GooseMode::Chat, "plan".to_string()),
         ]),
         HashMap::from([
-            ("yolo".to_string(), GooseMode::Auto),
-            ("default".to_string(), GooseMode::Approve),
-            ("auto_edit".to_string(), GooseMode::SmartApprove),
-            ("plan".to_string(), GooseMode::Chat),
+            ("yolo".to_string(), vec![GooseMode::Auto]),
+            ("default".to_string(), vec![GooseMode::Approve]),
+            ("auto_edit".to_string(), vec![GooseMode::SmartApprove]),
+            ("plan".to_string(), vec![GooseMode::Chat]),
         ])
         ; "gemini provider mapping"
     )]
@@ -1567,17 +1613,88 @@ mod tests {
             (GooseMode::Chat, "plan".to_string()),
         ]),
         HashMap::from([
-            ("bypassPermissions".to_string(), GooseMode::Auto),
-            ("default".to_string(), GooseMode::Approve),
-            ("acceptEdits".to_string(), GooseMode::SmartApprove),
-            ("plan".to_string(), GooseMode::Chat),
+            ("bypassPermissions".to_string(), vec![GooseMode::Auto]),
+            ("default".to_string(), vec![GooseMode::Approve]),
+            ("acceptEdits".to_string(), vec![GooseMode::SmartApprove]),
+            ("plan".to_string(), vec![GooseMode::Chat]),
         ])
         ; "claude provider mapping"
     )]
+    #[test_case(
+        HashMap::from([
+            (GooseMode::Auto, "full-access".to_string()),
+            (GooseMode::Approve, "read-only".to_string()),
+            (GooseMode::SmartApprove, "auto".to_string()),
+            (GooseMode::Chat, "read-only".to_string()),
+        ]),
+        HashMap::from([
+            ("full-access".to_string(), vec![GooseMode::Auto]),
+            ("read-only".to_string(), vec![GooseMode::Approve, GooseMode::Chat]),
+            ("auto".to_string(), vec![GooseMode::SmartApprove]),
+        ])
+        ; "codex duplicate read-only"
+    )]
     fn test_reverse_mode_mapping(
         forward: HashMap<GooseMode, String>,
-        expected: HashMap<String, GooseMode>,
+        expected: HashMap<String, Vec<GooseMode>>,
     ) {
-        assert_eq!(reverse_mode_mapping(&forward), expected);
+        let result = reverse_mode_mapping(&forward);
+        assert_eq!(result.len(), expected.len());
+        for (key, expected_modes) in &expected {
+            let actual = result.get(key).expect("missing key");
+            assert_eq!(
+                actual.len(),
+                expected_modes.len(),
+                "length mismatch for key {key}"
+            );
+            for mode in expected_modes {
+                assert!(actual.contains(mode), "missing {mode:?} for key {key}");
+            }
+        }
+    }
+
+    // Codex mapping: read-only maps to both Approve and Chat.
+    fn codex_reverse_modes() -> HashMap<String, Vec<GooseMode>> {
+        HashMap::from([
+            ("full-access".to_string(), vec![GooseMode::Auto]),
+            (
+                "read-only".to_string(),
+                vec![GooseMode::Approve, GooseMode::Chat],
+            ),
+            ("auto".to_string(), vec![GooseMode::SmartApprove]),
+        ])
+    }
+
+    #[test_case(
+        "full-access", GooseMode::Auto, Some(GooseMode::Auto)
+        ; "unique mapping returns the only candidate"
+    )]
+    #[test_case(
+        "read-only", GooseMode::Approve, Some(GooseMode::Approve)
+        ; "duplicate prefers current when current is Approve"
+    )]
+    #[test_case(
+        "read-only", GooseMode::Chat, Some(GooseMode::Chat)
+        ; "duplicate prefers current when current is Chat"
+    )]
+    #[test_case(
+        "read-only", GooseMode::Auto, Some(GooseMode::Approve)
+        ; "duplicate falls back to first when current not in candidates"
+    )]
+    #[test_case(
+        "unknown-id", GooseMode::Auto, None
+        ; "unknown mode id returns None"
+    )]
+    fn test_resolve_mode(mode_id: &str, current: GooseMode, expected: Option<GooseMode>) {
+        let reverse_modes = codex_reverse_modes();
+        let current = Arc::new(Mutex::new(current));
+        let result = resolve_mode(&reverse_modes, mode_id, &current);
+        // For the fallback case, just check we got *some* candidate (order is nondeterministic).
+        if mode_id == "read-only" && expected == Some(GooseMode::Approve) {
+            // Current (Auto) not in candidates — any candidate is valid.
+            assert!(result == Some(GooseMode::Approve) || result == Some(GooseMode::Chat));
+        } else {
+            assert_eq!(result, expected);
+        }
     }
 }
